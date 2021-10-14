@@ -7,7 +7,7 @@ import torch
 import torch.optim as optim
 import scipy.stats as ss
 import argparse
-from itertools import chain
+from itertools import chain, product
 import sys
 import random
 from transformers import (WEIGHTS_NAME, AdamW, BertConfig, BertTokenizer, 
@@ -39,6 +39,15 @@ from parser import Parser, recursion, program_eq, split_prog
 from collections import Counter
 from torch.utils.tensorboard import SummaryWriter
 
+# add for ROUGE
+from rouge_score import rouge_scorer
+
+# add for PARENT
+from table_text_eval import _table_reader_v2, parent
+from parse_table import parse_table_logicnlg_webnlg, parse_table_totto_webnlg
+
+# add for CO (Content Ordering)
+from fastDamerauLevenshtein import damerauLevenshtein
 
 # environment: pytorch==1.4.0 (cpu-only), transformers==2.8.1, allennlp==0.9.0
 
@@ -51,7 +60,7 @@ def parse_opt():
     # general 
     parser = argparse.ArgumentParser()
     parser.add_argument('--verify_file', default=None, type=str, help='Input verify file')
-    parser.add_argument('--verify_linking', default=None, type=str, help='Link file to obtain meta information')    
+    parser.add_argument('--verify_linking', default=None, type=str, help='Link file to obtain meta information') 
     parser.add_argument("--batch_size", default=16, type=int, help="Max gradient norm.")
     parser.add_argument("--csv_path", default='data/all_csv', type=str, help="all_csv path")    
 
@@ -79,6 +88,9 @@ def parse_opt():
     parser.add_argument("--parse_model_load_from", default=None, type=str, help="which model to load from")
     parser.add_argument("--cache_dir", default='/tmp/', type=str, help="where to cache the BERT model")
 
+    # specifically for PARENT
+    parser.add_argument('--verify_table', default=None, type=str, help='For LogicNLG: Path to folder containing CSVs of tables, For ToTTo: Path to textfile containing one table per row')   
+    parser.add_argument("--table_type", default='totto', type=str, help="table format, either 'totto' or 'logicnlg'")
 
     args = parser.parse_args()
     return args
@@ -117,6 +129,126 @@ def calculate_bleu(args):
 
     print("bleu_1: {} / bleu_2: {} / bleu_3: {}".format(bleu_1, bleu_2, bleu_3))
 
+# ROUGE 
+def calculate_rouge(args):
+    
+    # Instantiate rouge scorer from rouge_scorer package
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
+
+    # Read in generated predictions (hypotheses)
+    with open(args.verify_file, 'r') as f:
+        hypothesis = json.load(f)
+
+    # Read in generated gold standards (references)
+    with open(args.verify_linking, 'r') as f:
+        reference = json.load(f)
+
+    assert len(hypothesis) == len(reference)
+
+    def func_compute_rouge(table_id, reference, hypothesis, scorer=scorer):
+        
+        # Generate list of reference and predicted sentences
+        sent_rouge_1, sent_rouge_L = [], []
+        references = [_[0].lower() for _ in reference[table_id]]
+        hypotheses = [_.lower() for _ in hypothesis[table_id]]
+
+        # Iterate through all pairs of <reference>-<hypothesis> for this table
+        for (ref,hyp) in list(product(references, hypotheses)):
+            output = scorer.score(ref, hyp)
+            sent_rouge_1.append(output['rouge1'].fmeasure)
+            sent_rouge_L.append(output['rougeL'].fmeasure)
+
+        return sent_rouge_1, sent_rouge_L
+
+    sent_rouge_1, sent_rouge_L = [], []
+    for table_id in hypothesis.keys():
+        cur_sent_rouge_1, cur_sent_rouge_L = func_compute_rouge(table_id, reference, hypothesis)
+        sent_rouge_1.extend(cur_sent_rouge_1)
+        sent_rouge_L.extend(cur_sent_rouge_L)
+
+    rouge_1 = sum(sent_rouge_1) / len(sent_rouge_1)
+    rouge_L = sum(sent_rouge_L) / len(sent_rouge_L)
+
+    print("rouge_1: {} / rouge_L: {}".format(rouge_1, rouge_L))
+
+# CO (Content Ordering, Computed with Normalized Damerau Levenshtein)
+def calculate_co(args):
+    
+    # Read in generated predictions (hypotheses)
+    with open(args.verify_file, 'r') as f:
+        hypothesis = json.load(f)
+
+    # Read in generated gold standards (references)
+    with open(args.verify_linking, 'r') as f:
+        reference = json.load(f)
+
+    assert len(hypothesis) == len(reference)
+
+    def func_compute_co(table_id, reference, hypothesis):
+    
+        # Generate list of reference and predicted sentences
+        sent_co = []
+        references = [_[0].lower() for _ in reference[table_id]]
+        hypotheses = [_.lower() for _ in hypothesis[table_id]]
+
+        # Iterate through all pairs of <reference>-<hypothesis> for this table
+        for (ref,hyp) in list(product(references, hypotheses)):
+            sent_co.append(1 - damerauLevenshtein(ref, hyp, similarity=True))
+
+        return sent_co
+
+    sent_co = []
+    for table_id in hypothesis.keys():
+        cur_sent_co = func_compute_co(table_id, reference, hypothesis)
+        sent_co.extend(cur_sent_co)
+
+    co = sum(sent_co) / len(sent_co)
+
+    print("CO (Content Ordering, AKA Normalized Damerau Levenshtein Distance): {}".format(co))
+
+# PARENT
+def calculate_parent(args):
+
+    # Read in generated predictions (hypotheses)
+    with open(args.verify_file, 'r') as f:
+        hypothesis = json.load(f)
+    # Read in generated gold standards (references)
+    with open(args.verify_linking, 'r') as f:
+        reference = json.load(f)
+    # Read in tables
+    if args.table_type=="totto":
+        pass
+    elif args.table_type=="logicnlg":
+        table = parse_table_logicnlg_webnlg(args.verify_table)
+    else:
+        return None
+
+    assert len(hypothesis) == len(reference)
+    
+    def func_compute_parent(table_id, reference, hypothesis, table):
+        
+        sent_parent = []
+
+        # Generate references for a given table as a list of lists
+        references = [[_[0].lower().split(' ') for _ in reference[table_id]]] 
+        
+        # Loop through each predicted statement for the table
+        for hyp in hypothesis[table_id]:
+            predictions = [hyp.lower().split()]        # Format predicted sentence as a list of tokens
+            tables = _table_reader_v2(table[table_id]) # Format table as a generator using _table_reader_v2
+            parent_scores = parent(predictions = predictions, 
+                                   references  = references,
+                                   tables      = tables)
+            sent_parent.append(parent_scores[2])       # Take second index, which corresponds to PARENT score
+        return sent_parent
+
+    sent_parent = []
+    for table_id in hypothesis.keys():
+        cur_sent_parent = func_compute_parent(table_id, reference, hypothesis, table)
+        sent_parent.extend(cur_sent_parent)
+
+    parent_score = sum(sent_parent) / len(sent_parent)
+    print("parent: {}".format(parent_score))
 
 # NLI-Acc
 def nli_forward_pass(f, example, model, args):
@@ -466,9 +598,17 @@ def calculate_sp_metric(args):
 
 if __name__ == '__main__':
     args = parse_opt()
-    "Start calculating BLEU Score"
+    print("\nStart calculating BLEU Score")
     calculate_bleu(args)
 
+    print("\nStart calculating ROUGE Score")
+    calculate_rouge(args)
+
+    print("\nStart calculating PARENT Score")
+    calculate_parent(args)
+    
+    print("\nStart calculating CO (Content Ordering) Score")
+    calculate_co(args)
 
     print("\nStart calculating NLI-ACC, this evaluation might take around 0.5 hour for CPU-only device")
     config = BertConfig.from_pretrained(args.nli_model, cache_dir='tmp/')
