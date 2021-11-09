@@ -235,7 +235,7 @@ def calculate_bleu(args):
 def calculate_rouge(args):
 
     # Instantiate rouge scorer from rouge_scorer package
-    scorer = rouge_scorer.RougeScorer(["rouge1", "rougeL"], use_stemmer=True)
+    scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
 
     # Read in generated predictions (hypotheses)
     with open(args.verify_file, "r") as f:
@@ -250,7 +250,7 @@ def calculate_rouge(args):
     def func_compute_rouge(table_id, reference, hypothesis, scorer=scorer):
 
         # Generate list of reference and predicted sentences
-        sent_rouge_1, sent_rouge_L = [], []
+        sent_rouge_1, sent_rouge_2, sent_rouge_L = [], [], []
         references = [_[0].lower() for _ in reference[table_id]]
         hypotheses = [_.lower() for _ in hypothesis[table_id]]
 
@@ -258,22 +258,25 @@ def calculate_rouge(args):
         for (ref, hyp) in list(product(references, hypotheses)):
             output = scorer.score(ref, hyp)
             sent_rouge_1.append(output["rouge1"].fmeasure)
+            sent_rouge_2.append(output["rouge2"].fmeasure)
             sent_rouge_L.append(output["rougeL"].fmeasure)
 
-        return sent_rouge_1, sent_rouge_L
+        return sent_rouge_1, sent_rouge_2, sent_rouge_L
 
-    sent_rouge_1, sent_rouge_L = [], []
+    sent_rouge_1, sent_rouge_2, sent_rouge_L = [], [], []
     for table_id in hypothesis.keys():
-        cur_sent_rouge_1, cur_sent_rouge_L = func_compute_rouge(
+        cur_sent_rouge_1, cur_sent_rouge_2, cur_sent_rouge_L = func_compute_rouge(
             table_id, reference, hypothesis
         )
         sent_rouge_1.extend(cur_sent_rouge_1)
+        sent_rouge_2.extend(cur_sent_rouge_2)
         sent_rouge_L.extend(cur_sent_rouge_L)
 
     rouge_1 = sum(sent_rouge_1) / len(sent_rouge_1)
+    rouge_2 = sum(sent_rouge_2) / len(sent_rouge_2)
     rouge_L = sum(sent_rouge_L) / len(sent_rouge_L)
 
-    print("rouge_1: {} / rouge_L: {}".format(rouge_1, rouge_L))
+    print("rouge_1: {} / rouge_2: {} / rouge_L: {}".format(rouge_1, rouge_2, rouge_L))
 
 
 # CO (Content Ordering, Computed with Normalized Damerau Levenshtein)
